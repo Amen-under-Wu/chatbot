@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>chatbot</title>
+</head>
+<body>
+
+<h3>chatbot</h3>
+
+<p>
+API Key:<br>
+<textarea id="apikey" rows="1"></textarea><br>
+Model:<br>
+<textarea id="model" rows="1">deepseek-flash</textarea>
+</p>
+
+<hr>
+
+<h4>对话</h4>
+<div id="conv"></div>
+
+<hr>
+
+<h4>对话树（缩略，点击节点 = 加载该节点作为历史继续对话；叶子节点可删除）</h4>
+<div id="tree"></div>
+
+<hr>
+
+<h4>对话树 JSON</h4>
+<textarea id="json" rows="14"></textarea><br>
+<button id="btnDownload">下载 JSON</button>
+<button id="btnLoad">从上方 JSON 载入</button>
+<button id="btnClear">清空全部</button>
+
+<script>
+var tree = { role: 'root', content: '', children: [] };
+var conversation = [{ role: 'user', content: '' }];
+var busy = false;
+
+function $(id) { return document.getElementById(id); }
+
+function fullWidth(el) {
+  el.style.width = '100%';
+  el.style.boxSizing = 'border-box';
+  el.style.display = 'block';
+}
+
+/* ---------- 对话渲染 ---------- */
+
+function renderConversation() {
+  var conv = $('conv');
+  conv.innerHTML = '';
+  var tas = [];
+  conversation.forEach(function (msg, i) {
+    var ta = document.createElement('textarea');
+    ta.rows = msg.role === 'user' ? 2 : 8;
+    fullWidth(ta);
+    ta.value = msg.content;
+    ta.addEventListener('input', function () { conversation[i].content = ta.value; });
+    conv.appendChild(ta);
+    tas.push(ta);
+
+    if (msg.role === 'user') {
+      var btn = document.createElement('button');
+      btn.textContent = 'submit';
+      btn.disabled = busy;
+      btn.addEventListener('click', function () { doSubmit(i); });
+      conv.appendChild(btn);
+    }
+    conv.appendChild(document.createElement('br'));
+  });
+  return tas;
+}
+
+/* ---------- 提交（流式） ---------- */
+
+async function doSubmit(i) {
+  if (busy) return;
+  if (i < 0 || i >= conversation.length) return;
+  if (conversation[i].role !== 'user') return;
+
+  var msgs = conversation.slice(0, i + 1);
+  while (msgs.length && msgs[msgs.length - 1].content.trim() === '') msgs.pop();
+  if (msgs.length === 0) return;
+
+  var key = $('apikey').value.trim();
+  if (!key) { alert('请先填写 API Key'); return; }
+  var model = $('model').value.trim() || 'deepseek-flash';
+
+  conversation = msgs;
+  busy = true;
+  renderConversation();
+
+  var payload = {
+    model: model,
+    messages: msgs.map(function (m) { return { role: m.role, content: m.content }; }),
+    stream: true,
+    thinking: {
+      "type": "disabled"
+    }
+  };
+
+  var aidx = -1;
+
+  try {
+    var resp = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + key
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      var errText = await resp.text();
+      throw new Error('HTTP ' + resp.status + ' : ' + errText);
+    }
+    if (!resp.body) throw new Error('当前浏览器不支持流式读取响应');
+
+    // 先插入一条空的 assistant 消息作为流式输出的接收容器
+    conversation.push({ role: 'assistant', content: '' });
+    aidx = conversation.length - 1;
+    var tas = renderConversation();
+    var ta = tas[aidx];
+
+    var reader = resp.body.getReader();
+    var decoder = new TextDecoder('utf-8');
+    var buf = '';
+    var acc = '';
+
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buf += decoder.decode(chunk.value, { stream: true });
+
+      var lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (var k = 0; k < lines.length; k++) {
+        var s = lines[k].trim();
+        if (!s || s.charAt(0) === ':') continue;
+        if (s.indexOf('data:') !== 0) continue;
+
+        var data = s.slice(5).trim();
+        if (data === '[DONE]') continue;
+
+        var j;
+        try { j = JSON.parse(data); } catch (e) { continue; }
+
+        var delta = j.choices && j.choices[0] && j.choices[0].delta;
+        var piece = delta && delta.content ? delta.content : '';
+        if (piece) {
+          acc += piece;
+          conversation[aidx].content = acc;
+          if (ta) ta.value = acc;
+        }
+      }
+    }
+
+    // 补上可能残留在缓冲区里的最后一行
+    var tail = buf.trim();
+    if (tail.indexOf('data:') === 0) {
+      var td = tail.slice(5).trim();
+      if (td && td !== '[DONE]') {
+        try {
+          var tj = JSON.parse(td);
+          var tdelta = tj.choices && tj.choices[0] && tj.choices[0].delta;
+          if (tdelta && tdelta.content) {
+            acc += tdelta.content;
+            conversation[aidx].content = acc;
+            if (ta) ta.value = acc;
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (!acc) conversation.splice(aidx, 1); // 没有任何输出则不留空节点
+
+    busy = false;
+    mergePath(conversation);
+    conversation.push({ role: 'user', content: '' });
+    renderTree();
+    renderConversation();
+
+  } catch (e) {
+    if (aidx >= 0 && conversation[aidx] && conversation[aidx].content === '') {
+      conversation.splice(aidx, 1);
+    }
+    busy = false;
+    alert('请求失败: ' + (e && e.message ? e.message : String(e)));
+    renderConversation();
+  }
+}
+
+/* ---------- 树结构 ---------- */
+
+function mergePath(msgs) {
+  var node = tree;
+  for (var i = 0; i < msgs.length; i++) {
+    var m = msgs[i];
+    var child = null;
+    for (var j = 0; j < node.children.length; j++) {
+      var c = node.children[j];
+      if (c.role === m.role && c.content === m.content) { child = c; break; }
+    }
+    if (!child) {
+      child = { role: m.role, content: m.content, children: [] };
+      node.children.push(child);
+    }
+    node = child;
+  }
+}
+
+function removeNode(parent, target) {
+  var idx = parent.children.indexOf(target);
+  if (idx >= 0) { parent.children.splice(idx, 1); return true; }
+  for (var i = 0; i < parent.children.length; i++) {
+    if (removeNode(parent.children[i], target)) return true;
+  }
+  return false;
+}
+
+function findPath(cur, target, acc) {
+  if (cur === target) return acc;
+  for (var i = 0; i < cur.children.length; i++) {
+    var r = findPath(cur.children[i], target, acc.concat([cur.children[i]]));
+    if (r) return r;
+  }
+  return null;
+}
+
+function loadPath(node) {
+  var path = findPath(tree, node, []);
+  if (!path) return;
+  conversation = path.map(function (n) { return { role: n.role, content: n.content }; });
+  if (conversation.length === 0 || conversation[conversation.length - 1].role === 'assistant') {
+    conversation.push({ role: 'user', content: '' });
+  }
+  renderConversation();
+}
+
+function makeLi(n) {
+  var li = document.createElement('li');
+
+  var btn = document.createElement('button');
+  var preview = n.content.replace(/\s+/g, ' ').slice(0, 60);
+  btn.textContent = (n.role === 'user' ? '[U] ' : '[A] ') + preview;
+  btn.addEventListener('click', function () { loadPath(n); });
+  li.appendChild(btn);
+
+  if (n.children.length === 0) {
+    var del = document.createElement('button');
+    del.textContent = '×';
+    del.title = '删除该叶子节点';
+    del.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      removeNode(tree, n);
+      renderTree();
+    });
+    li.appendChild(del);
+  } else {
+    var ul = document.createElement('ul');
+    n.children.forEach(function (c) { ul.appendChild(makeLi(c)); });
+    li.appendChild(ul);
+  }
+  return li;
+}
+
+function renderTree() {
+  var el = $('tree');
+  el.innerHTML = '';
+  if (tree.children.length === 0) {
+    el.appendChild(document.createTextNode('(空)'));
+  } else {
+    var ul = document.createElement('ul');
+    tree.children.forEach(function (c) { ul.appendChild(makeLi(c)); });
+    el.appendChild(ul);
+  }
+  $('json').value = JSON.stringify(tree, null, 2);
+  try { localStorage.setItem('chatbot_tree', JSON.stringify(tree)); } catch (e) {}
+}
+
+/* ---------- JSON 存取 ---------- */
+
+$('btnDownload').addEventListener('click', function () {
+  var blob = new Blob([JSON.stringify(tree, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'chat-tree.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+});
+
+$('btnLoad').addEventListener('click', function () {
+  try {
+    var t = JSON.parse($('json').value);
+    if (!t || typeof t !== 'object' || !Array.isArray(t.children)) throw new Error('不是合法的树结构');
+    tree = t;
+    conversation = [{ role: 'user', content: '' }];
+    renderTree();
+    renderConversation();
+  } catch (e) {
+    alert('载入失败: ' + e.message);
+  }
+});
+
+$('btnClear').addEventListener('click', function () {
+  if (!confirm('确定清空全部对话树？')) return;
+  tree = { role: 'root', content: '', children: [] };
+  conversation = [{ role: 'user', content: '' }];
+  renderTree();
+  renderConversation();
+});
+
+/* ---------- 初始化 ---------- */
+
+(function init() {
+  fullWidth($('apikey'));
+  fullWidth($('model'));
+  fullWidth($('json'));
+
+  try {
+    var saved = localStorage.getItem('chatbot_tree');
+    if (saved) {
+      var t = JSON.parse(saved);
+      if (t && Array.isArray(t.children)) tree = t;
+    }
+  } catch (e) {}
+
+  renderTree();
+  renderConversation();
+})();
+</script>
+
+</body>
+</html>
