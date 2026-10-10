@@ -3,6 +3,20 @@
 <head>
 <meta charset="utf-8">
 <title>chatbot</title>
+<style>
+  /* 对话树：缩进收紧 + 节点单行省略，避免深层节点被挤成细长条 */
+  #tree { overflow-x: auto; }                /* 溢出收在树自己的框里，不撑宽整页 */
+  #tree ul { margin: 0; padding-left: 0; list-style: none; }
+  #tree li { margin: 0; padding: 0; }
+  #tree li > ul { padding-left: 14px; border-left: 1px solid #e0e0e0; }
+  #tree li > button {
+    display: inline-block; vertical-align: middle;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: calc(100% - 2.2em);   /* 给后面的 × 留位置 */
+    min-width: 5em;                  /* 再深也保留一点宽度，不缩成小竖条 */
+  }
+  #tree li > button:nth-of-type(2) { min-width: 0; max-width: 2.4em; }  /* × 不受影响 */
+</style>
 </head>
 <body>
 
